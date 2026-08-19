@@ -2,10 +2,14 @@ name: Auto Space Video
 
 on:
   schedule:
-    # Twice a day, 12:00 and 18:00 UTC. Times are UTC, not your local time.
     - cron: '0 12,18 * * *'
   workflow_dispatch:
-    # Manual trigger: "Run workflow" button in the Actions tab.
+    inputs:
+      dry_run:
+        description: Build and validate a video without uploading to YouTube
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: write
@@ -26,15 +30,16 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-          cache: 'pip'
+          cache: pip
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: python -m pip install --upgrade pip && python -m pip install -r requirements.txt
 
       - name: Ensure FFmpeg is available
         run: |
           if ! command -v ffmpeg >/dev/null; then
-            sudo apt-get update -y && sudo apt-get install -y ffmpeg
+            sudo apt-get update -y
+            sudo apt-get install -y ffmpeg
           fi
           ffmpeg -version | head -1
 
@@ -55,22 +60,25 @@ jobs:
           MUSIC_URL: ${{ secrets.MUSIC_URL }}
           MUSIC_VOLUME: ${{ secrets.MUSIC_VOLUME }}
           TARGET_SECONDS: ${{ secrets.TARGET_SECONDS }}
-          DRY_RUN: ${{ secrets.DRY_RUN }}
           LOG_LEVEL: ${{ secrets.LOG_LEVEL }}
-        run: python scripts/run_pipeline.py
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || secrets.DRY_RUN }}
+        run: python main.py
 
-      - name: Upload video and artifacts
+      - name: Upload video and metadata
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: video-output
+          name: video-output-${{ github.run_id }}
           path: |
             output/final.mp4
             output/*.json
-          retention-days: 2
+          if-no-files-found: warn
+          retention-days: 7
 
       - name: Commit topic state back to the repo
-        if: success() && steps.pipeline.outcome == 'success'
+        if: success() && steps.pipeline.outcome == 'success' && env.DRY_RUN != '1' && env.DRY_RUN != 'true'
+        env:
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || secrets.DRY_RUN }}
         run: |
           git config user.name "Auto Space Video Bot"
           git config user.email "actions@github.com"
@@ -90,8 +98,12 @@ jobs:
           if [ -n "${NOTIFY_WEBHOOK}" ]; then
             python - <<'EOF'
             import json, os, urllib.request
-            payload = {"content": "Auto Space Video pipeline FAILED. Check the Actions log: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"}
-            req = urllib.request.Request(os.environ["NOTIFY_WEBHOOK"], data=json.dumps(payload).encode(), headers={"Content-Type": "application/json"})
-            urllib.request.urlopen(req, timeout=15)
+            payload = {"content": "Auto Space Video pipeline FAILED. Check the GitHub Actions run."}
+            req = urllib.request.Request(
+                os.environ["NOTIFY_WEBHOOK"],
+                data=json.dumps(payload).encode(),
+                headers={"Content-Type": "application/json"},
+            )
+            urllib.request.urlopen(req, timeout=15).read()
             EOF
           fi
