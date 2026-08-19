@@ -1,21 +1,12 @@
-"""Fetches one image per script segment for the video.
-
-Strategy (each layer degrades gracefully so a video is always produced):
-  1. NASA Image Library search -- free, no key needed, matches visual hints.
-  2. NASA APOD (Astronomy Picture of the Day) -- random past images.
-  3. Locally generated space gradient -- guaranteed last resort.
-
-All images are downloaded to output/images/ and verified as real pictures.
-"""
-
+"""Reliable NASA image acquisition with validation and graceful fallbacks."""
 from __future__ import annotations
 
 import json
 import os
 import random
 import re
+import subprocess
 import time
-import urllib.parse
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -23,79 +14,88 @@ import requests
 
 from scripts.config import settings
 
-IMG_MAGIC = {
-    b"\xff\xd8\xff": ".jpg",
-    b"\x89PNG\r\n\x1a\n": ".png",
-    b"GIF87a": ".gif",
-    b"GIF89a": ".gif",
-    b"RIFF": ".webp",
-}
+IMAGE_RE = re.compile(r"\.(?:jpg|jpeg|png|webp)(?:\?|$)", re.I)
+MAGIC = (b"\xff\xd8\xff", b"\x89PNG\r\n\x1a\n", b"GIF87a", b"GIF89a", b"RIFF")
+SESSION = requests.Session()
+SESSION.headers.update({"User-Agent": "NASA-Videos-pipeline/2.0"})
+
+
+def _request(url: str, *, timeout: int = 20, **kwargs: Any) -> requests.Response:
+    last: Exception | None = None
+    for attempt in range(3):
+        try:
+            response = SESSION.get(url, timeout=timeout, **kwargs)
+            if response.status_code in {429, 500, 502, 503, 504}:
+                time.sleep(2 ** attempt)
+                continue
+            response.raise_for_status()
+            return response
+        except requests.RequestException as exc:
+            last = exc
+            if attempt < 2:
+                time.sleep(2 ** attempt)
+    raise requests.RequestException(str(last or "request failed"))
 
 
 def is_valid_image(path: str) -> bool:
     try:
         with open(path, "rb") as fh:
             head = fh.read(12)
-        return any(head.startswith(m) for m in IMG_MAGIC)
+        return any(head.startswith(magic) for magic in MAGIC) and os.path.getsize(path) > 512
     except OSError:
         return False
 
 
-def _get(url: str, timeout: int = 20, **kwargs: Any) -> requests.Response:
-    return requests.get(url, timeout=timeout, headers={"User-Agent": "autospace/1.0"}, **kwargs)
-
-
-def _download(url: str, dest: str, timeout: int = 30) -> str | None:
+def _download(url: str, dest: str) -> str | None:
+    tmp = dest + ".part"
     try:
-        resp = _get(url, timeout=timeout, stream=True)
-        if resp.status_code != 200:
-            return None
-        with open(dest, "wb") as fh:
-            for chunk in resp.iter_content(chunk_size=1 << 16):
-                fh.write(chunk)
-        if is_valid_image(dest):
+        response = _request(url, timeout=40, stream=True)
+        with open(tmp, "wb") as fh:
+            for chunk in response.iter_content(65536):
+                if chunk:
+                    fh.write(chunk)
+        if is_valid_image(tmp):
+            os.replace(tmp, dest)
             return dest
     except (requests.RequestException, OSError):
         pass
+    finally:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
     return None
 
 
-def _search_nasa_library(query: str, limit: int = 8) -> list[str]:
-    """Search the NASA Image Library; returns a list of direct image URLs."""
-    url = "https://images-api.nasa.gov/search"
-    params = {"q": query, "media_type": "image", "page_size": limit}
+def _search_nasa(query: str, limit: int = 10) -> list[str]:
     try:
-        resp = _get(url, params=params)
-        resp.raise_for_status()
-        items = resp.json().get("collection", {}).get("items", [])
+        data = _request(
+            "https://images-api.nasa.gov/search",
+            params={"q": query, "media_type": "image", "page_size": limit},
+        ).json()
     except (requests.RequestException, ValueError):
         return []
     urls: list[str] = []
-    for item in items:
-        links = item.get("links") or []
-        for link in links:
-            href = link.get("href") or ""
-            if re.search(r"\.(jpg|jpeg|png|webp)(\?|$)", href, re.I):
+    for item in data.get("collection", {}).get("items", []):
+        for link in item.get("links", []):
+            href = link.get("href", "")
+            if IMAGE_RE.search(href):
                 urls.append(href)
     return urls
 
 
-def _random_apod_images(count: int = 10) -> list[str]:
-    """Random APOD images within roughly the last 4 years."""
+def _apod_fallback(limit: int = 8) -> list[str]:
     urls: list[str] = []
     now = datetime.utcnow()
-    dates = [
-        (now - timedelta(days=random.randint(5, 1460))).strftime("%Y-%m-%d") for _ in range(count)
-    ]
-    for d in dates:
-        url = "https://api.nasa.gov/planetary/apod"
+    for _ in range(limit):
+        date = (now - timedelta(days=random.randint(3, 1460))).strftime("%Y-%m-%d")
         try:
-            resp = _get(url, params={"api_key": settings.nasa_api_key, "date": d, "hd": False})
-            if resp.status_code != 200:
-                continue
-            data = resp.json()
-            href = data.get("hdurl") or data.get("url")
-            if href and re.search(r"\.(jpg|jpeg|png|webp)(\?|$)", href, re.I):
+            data = _request(
+                "https://api.nasa.gov/planetary/apod",
+                params={"api_key": settings.nasa_api_key, "date": date},
+            ).json()
+            href = data.get("hdurl") or data.get("url", "")
+            if data.get("media_type") == "image" and IMAGE_RE.search(href):
                 urls.append(href)
         except (requests.RequestException, ValueError):
             continue
@@ -103,86 +103,49 @@ def _random_apod_images(count: int = 10) -> list[str]:
 
 
 def _placeholder(dest: str, seed: str) -> str:
-    """Generate a deep-space gradient image with ffmpeg as the final fallback."""
-    import subprocess
-
-    hues = ["#050514", "#0a1035", "#151b54", "#02030c"]
-    cols = random.Random(seed).choice(
-        [
-            (hues[0], hues[1]),
-            (hues[2], hues[0]),
-            (hues[0], hues[3]),
-        ]
-    )
-    cmd = [
-        "ffmpeg", "-y", "-loglevel", "error",
-        "-f", "lavfi", "-i",
-        f"gradients=s=1280x720:c0={cols[0]}:c1={cols[1]}:d=1",
-        "-frames:v", "1", dest,
-    ]
+    rng = random.Random(seed)
+    c0, c1 = rng.choice([("#050514", "#101a3b"), ("#080812", "#25205a"), ("#02030c", "#111827")])
     try:
-        subprocess.run(cmd, check=True, capture_output=True, timeout=30)
-        return dest if is_valid_image(dest) else ""
-    except (subprocess.SubprocessError, FileNotFoundError):
+        subprocess.run(
+            ["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi", "-i",
+             f"gradients=s=1280x720:c0={c0}:c1={c1}:d=1", "-frames:v", "1", dest],
+            check=True, timeout=30, capture_output=True,
+        )
+    except (OSError, subprocess.SubprocessError):
         return ""
-
-
-def _pick_from(urls: list[str], used: set[str]) -> str | None:
-    for u in urls:
-        if u in used:
-            continue
-        return u
-    return None
+    return dest if is_valid_image(dest) else ""
 
 
 def fetch_one(query: str, used_urls: set[str], index: int) -> dict[str, Any]:
-    """Fetch one image for a query; returns {path, source, url} or {path:""}."""
     os.makedirs(settings.images_dir, exist_ok=True)
     dest = os.path.join(settings.images_dir, f"img_{index:02d}.jpg")
-
-    # Layer 1: NASA Image Library search
-    for q in (query, query.split()[0] if query.split() else query):
-        for url in _search_nasa_library(q, limit=8):
+    queries = [query.strip(), " ".join(query.split()[:3]).strip(), "space" ]
+    for q in dict.fromkeys(x for x in queries if x):
+        for url in _search_nasa(q):
             if url in used_urls:
                 continue
-            saved = _download(url, dest)
-            if saved:
-                return {"path": os.path.relpath(saved, settings.output_dir), "source": "nasa_library", "url": url}
-            time.sleep(0.2)
-
-    # Layer 2: random APOD
-    for url in _random_apod_images(12):
-        if url in used_urls:
-            continue
-        saved = _download(url, dest)
-        if saved:
-            return {"path": os.path.relpath(saved, settings.output_dir), "source": "apod", "url": url}
-        time.sleep(0.2)
-
-    # Layer 3: generated placeholder
+            if _download(url, dest):
+                return {"path": os.path.relpath(dest, settings.output_dir), "source": "nasa_library", "url": url}
+    for url in _apod_fallback():
+        if url not in used_urls and _download(url, dest):
+            return {"path": os.path.relpath(dest, settings.output_dir), "source": "apod", "url": url}
     saved = _placeholder(dest, f"{query}-{index}")
-    if saved:
-        return {"path": os.path.relpath(saved, settings.output_dir), "source": "placeholder", "url": ""}
-    return {"path": "", "source": "missing", "url": ""}
+    return {"path": os.path.relpath(saved, settings.output_dir) if saved else "", "source": "placeholder" if saved else "missing", "url": ""}
 
 
 def fetch_images(script: dict[str, Any]) -> dict[str, Any]:
+    os.makedirs(settings.output_dir, exist_ok=True)
     used: set[str] = set()
     manifest = {"images": []}
-    for i, seg in enumerate(script["segments"]):
-        result = fetch_one(seg.get("visual_hint", "space"), used, i)
+    for index, segment in enumerate(script.get("segments", [])):
+        result = fetch_one(segment.get("visual_hint", "space"), used, index)
         manifest["images"].append(result)
-        if result["url"]:
+        if result.get("url"):
             used.add(result["url"])
-        time.sleep(0.3)
     with open(os.path.join(settings.output_dir, "images.json"), "w", encoding="utf-8") as fh:
         json.dump(manifest, fh, ensure_ascii=False, indent=2)
     return manifest
 
 
 def absolute_image_paths(manifest: dict[str, Any]) -> list[str]:
-    paths: list[str] = []
-    for item in manifest.get("images", []):
-        rel = item.get("path", "")
-        paths.append(os.path.join(settings.output_dir, rel) if rel else "")
-    return paths
+    return [os.path.join(settings.output_dir, item["path"]) if item.get("path") else "" for item in manifest.get("images", [])]
